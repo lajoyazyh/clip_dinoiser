@@ -13,4 +13,6 @@ __all__ = [
     "SliceFeatureProjector",
     "SliceFindingResult",
     "SoftKMeansSliceFinder",
+    "ToolBenchSliceFinder",
 ]
+from .toolbench_finder import ToolBenchSliceFinder
