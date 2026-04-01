@@ -4,6 +4,8 @@ import glob
 import numpy as np
 import sys
 import random
+import subprocess
+import time
 
 sys.path.append(os.path.dirname(__file__))
 from slice_quality_predictor import calculate_metrics_for_inference, SliceQualityPredictor
@@ -38,7 +40,7 @@ def load_global_pool():
                 pool.append({
                     "query": query,
                     "file_path": f,
-                    "metrics": metrics, # [Res, Chain, Topo, Comp, Dom]
+                    "metrics": metrics,
                     "raw_data": base_map[query]
                 })
         except:
@@ -46,14 +48,9 @@ def load_global_pool():
     return pool
 
 def recommend_best_feature_ranges(global_pool, predictor):
-    """
-    智能探索多个维度区间，找出一个能让预测通过率最大化的特征区间组合，
-    作为系统的 "Smart Suggestion" 提供给用户参考。
-    """
     best_pred = 0
     best_limits = {}
     
-    # We do a fast random search over bounds to find a highly predictive sub-region
     for _ in range(100):
         limits = {
             "chain_min": random.uniform(0.0, 0.4),
@@ -108,6 +105,60 @@ def load_recommendations(predictor):
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[:3]  
 
+def run_physical_evaluation(mix_id, target_dir, num_samples):
+    print(f"\n🚀 [实时任务监控] 正在向物理显卡投递训练/验证任务: {mix_id}")
+    print(f"数据量: {num_samples} 独立请求正在启动...")
+    
+    # Check initial inference state
+    out_dir = os.path.join(get_project_root(), f"data/surrogate_data/{mix_id}/inferences")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    start_count = len(glob.glob(os.path.join(out_dir, "*_CoT@1.json")))
+    target_count = start_count + num_samples
+    
+    cmd = ["bash", "run_vllm_task_node.sh", mix_id, target_dir]
+    
+    try:
+        proc = subprocess.Popen(cmd, cwd=get_project_root(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Monitor the output directory
+        print("-------------------------------------------------------")
+        while proc.poll() is None:
+            current_count = len(glob.glob(os.path.join(out_dir, "*_CoT@1.json")))
+            sys.stdout.write(f"\r⏳ [Live Progress] 推理生成中: {current_count}/{target_count} ({current_count/target_count*100:.1f}%)   ")
+            sys.stdout.flush()
+            if current_count >= target_count:
+                break
+            time.sleep(2.0)
+            
+        proc.wait()
+        
+        # Recalculate physical pass rate
+        final_files = glob.glob(os.path.join(out_dir, "*_CoT@1.json"))
+        passed = 0
+        total = len(final_files)
+        
+        for f in final_files:
+            try:
+                with open(f, "r") as fp:
+                    d = json.load(fp)
+                    c_valid = d.get('answer_generation', {}).get('valid_data', False)
+                    c_err = "error" in str(d).lower()
+                    if c_valid and not c_err: passed += 1
+            except: pass
+            
+        real_pr = (passed / total) if total > 0 else 0.0
+        
+        print(f"\n🎉 [评测完成] 物理训练验证结束！")
+        print(f"✅ 测得绝对物理真实通过率: {real_pr:.2%}")
+        print("-------------------------------------------------------")
+        
+        return real_pr
+        
+    except Exception as e:
+        print(f"\n❌ [错误] 物理执行异常: {str(e)}")
+        return 0.0
+
 def main():
     root_dir = get_project_root()
     predictor = SliceQualityPredictor(os.path.join(os.path.dirname(__file__), 'paper_quality_predictor.pkl'))
@@ -124,13 +175,13 @@ def main():
     print(f"[Baseline] 大盘随机混合预期平均通过率: {baseline_pred:.2%}")
     print("-------------------------------------------------------\n")
     
-    recs = load_recommendations(predictor)
-    print(">> Surrogate Model (预测模型) 为您推荐的静态候选 Slice (Top-3):")
-    for i, (mix_id, pr, feats) in enumerate(recs):
-        print(f"  [{i+1}] {mix_id} | 预期: {pr:.2%} | (Chain={feats[1]:.2f}, Topo={feats[2]:.2f}, Comp={feats[3]:.2f}, Dom={feats[4]:.2f})")
-    print("-------------------------------------------------------\n")
-    
     while True:
+        recs = load_recommendations(predictor)
+        print("\n>> Surrogate Model (预测模型) 为您推荐的静态候选 Slice (Top-3):")
+        for i, (mix_id, pr, feats) in enumerate(recs):
+            print(f"  [{i+1}] {mix_id} | 预期: {pr:.2%} | (Chain={feats[1]:.2f}, Topo={feats[2]:.2f}, Comp={feats[3]:.2f}, Dom={feats[4]:.2f})")
+        print("-------------------------------------------------------\n")
+        
         print("请选择操作:")
         print("1. 接受以上静态推荐并跑真实评测")
         print("2. 自定义多维参数范围 (系统会先给出参数推荐)")
@@ -138,13 +189,23 @@ def main():
         choice = input("请输入选项 (1/2/3): ")
         
         if choice == '3':
+            print("系统退出，再见！")
             break
         elif choice == '1':
             sel = int(input("选择推荐编号 (1/2/3): ")) - 1
-            print(f"\n[Success] 准备执行: bash run_vllm_task_node.sh {recs[sel][0]} surrogate_training_mixtures/{recs[sel][0]}")
-            break
+            rec_mix_id = recs[sel][0]
+            rec_pred = recs[sel][1]
+            
+            # Since it's a pre-built static recommendation, grab its current sample size
+            # To mock the file execution, we will point it to the valid folder
+            mix_dir = f"surrogate_training_mixtures/{rec_mix_id}"
+            
+            print(f"\n[启动流水线] 开始对推荐集 {rec_mix_id} 进行物理测算 (预测通过率: {rec_pred:.2%})")
+            run_physical_evaluation(rec_mix_id, mix_dir, 50)
+            
+            _ = input("\n[操作完成] 按回车键继续下一轮洞察探索...")
+            
         elif choice == '2':
-            # 系统进行启发式搜索并给出参数推荐
             print("\n[系统推演中...] 正在为您搜索能取得极高通过率的潜藏特征边界组合...")
             best_lim, best_pred = recommend_best_feature_ranges(global_pool, predictor)
             print(f"💡 系统智能推荐: 如果您将范围限制在以下区间，预计可达到 {best_pred:.2%} 的超高通过率！")
@@ -199,12 +260,26 @@ def main():
                 
                 sat = input("\n您对此划分是否满意并准备导出评测？(y/n): ")
                 if sat.lower() == 'y':
-                    out_path = os.path.join(root_dir, "surrogate_training_mixtures/user_custom_slice_test.json")
+                    custom_id = f"user_custom_slice_{int(time.time())}"
+                    out_dir = os.path.join(root_dir, f"surrogate_training_mixtures/{custom_id}")
+                    os.makedirs(out_dir, exist_ok=True)
+                    
+                    out_path = os.path.join(out_dir, f"{custom_id}_test.json")
                     out_data = [item["raw_data"] for item in filtered]
                     with open(out_path, "w") as fp:
                         json.dump(out_data, fp, indent=2)
+                        
                     print(f"\n[Success] {len(out_data)} 个样本已物理导出至: {out_path}")
-                    break
+                    print(f"即将调用底层执行脚本进行物理模型训练与评测验证...\n")
+                    
+                    real_val = run_physical_evaluation(custom_id, f"surrogate_training_mixtures/{custom_id}", len(out_data))
+                    
+                    print(f"📊 [指标对齐分析]")
+                    print(f"您的专家预测期望值: {sub_pred:.2%}")
+                    print(f"显卡物理评测真实值: {real_val:.2%}")
+                    print(f"MAE 误差: {abs(sub_pred - real_val):.2%}")
+                    
+                    _ = input("\n[操作完成] 按回车键继续下一轮洞察探索...")
             except Exception as e:
                 print(f"输入错误: {e}")
 
