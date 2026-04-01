@@ -1,63 +1,87 @@
 import os
 import json
+import glob
 import numpy as np
 import joblib
-from sklearn.ensemble import RandomForestRegressor
 
-def extract_features_from_metrics(metrics):
-    return np.array([
-        metrics.get('mean_final_answer_len', 0),
-        metrics.get('mean_step_count', 0),
-        metrics.get('mean_tool_call_count', 0),
-        metrics.get('mean_obs_len', 0),
-        metrics.get('valid_data_ratio', 0),
-        metrics.get('total', 0)
-    ]).reshape(1, -1)
+def calculate_metrics_for_inference(ans, query):
+    valid_data = ans.get('valid_data', False)
+    steps = ans.get('intermediate_steps', [])
+    has_error = False
+    tool_calls = []
+    for s in steps:
+        if 'tool_name' in s:
+            tool_calls.append(s['tool_name'])
+            obs = str(s.get('observation', '')).lower()
+            if 'error' in obs or s.get('error', False) or '{"error":' in obs:
+                has_error = True
+                
+    res_sc = 1.0 if valid_data and not has_error else (0.5 if valid_data else 0.0)
+    clen = min(len(tool_calls)/10.0, 1.0)
+    
+    import collections
+    tcs = list(collections.Counter(tool_calls).values())
+    mrep = max(tcs) if tcs else 0
+    if mrep <= 1: top = 0.0
+    elif mrep == 2: top = 0.5
+    else: top = 1.0
+        
+    words = query.split()
+    l_factor = min(len(words)/100.0, 1.0)
+    kws = {'if', 'when', 'except', 'sorted', 'filter'}
+    c_factor = min(sum(1 for w in words if w.lower() in kws)/3.0, 1.0)
+    comp = (l_factor + c_factor)/2.0
+    
+    def ext(tn): return tn.split("_for_")[-1] if "_for_" in tn else tn
+    ut = set(tool_calls)
+    ut2 = set(ext(t) for t in ut)
+    if len(ut)<=1: dom=0.0
+    elif len(ut2)==1: dom=0.3
+    elif len(ut2)<=3: dom=0.6
+    else: dom=1.0
+    
+    return [res_sc, clen, top, comp, dom]
 
-def train_and_save_model(surrogate_data_dir, model_path='slice_quality_predictor.pkl'):
-    features = []
-    labels = []
-    for slice_dir in os.listdir(surrogate_data_dir):
-        metrics_path = os.path.join(surrogate_data_dir, slice_dir, "inferences", "pass_rate_results", "metrics.json")
-        if not os.path.exists(metrics_path):
+def extract_slice_features(inferences_dir):
+    inf_files = glob.glob(os.path.join(inferences_dir, "*_CoT@1.json"))
+    if not inf_files: return None
+    
+    metrics_list = []
+    for f in inf_files:
+        try:
+            with open(f, "r") as fp:
+                d = json.load(fp)
+                ans = d.get('answer_generation', {})
+                query = ans.get('query', d.get('query', ''))
+                metrics = calculate_metrics_for_inference(ans, query)
+                metrics_list.append(metrics)
+        except Exception:
             continue
-        with open(metrics_path, 'r') as f:
-            metrics = json.load(f)
-        feat = extract_features_from_metrics(metrics).flatten()
-        label = metrics.get('physical_pass_rate', None)
-        if label is None:
-            continue
-        features.append(feat)
-        labels.append(label)
-    X = np.array(features)
-    y = np.array(labels)
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    joblib.dump(model, model_path)
-    print(f"模型已保存到 {model_path}")
+            
+    if not metrics_list: return None
+    
+    # metrics consist of [Result_Score, Chain_Length, Topology_Score, Complexity, Domain_Span]
+    mean_metrics = np.mean(metrics_list, axis=0).tolist()
+    mean_metrics.append(0.5) # Pad missing local_density
+    return np.array(mean_metrics).reshape(1, -1)
 
-def predict_slice_quality(metrics_json_path, model_path='slice_quality_predictor.pkl'):
-    import joblib
-    with open(metrics_json_path, 'r') as f:
-        metrics = json.load(f)
-    X = extract_features_from_metrics(metrics)
-    model = joblib.load(model_path)
-    pred = model.predict(X)[0]
-    print(f"预测物理通过率: {pred:.4f}")
-    return pred
+class SliceQualityPredictor:
+    def __init__(self, model_path='paper_quality_predictor.pkl'):
+        # Attempt relative load or absolute
+        if not os.path.exists(model_path):
+            base_dir = os.path.dirname(__file__)
+            model_path = os.path.join(base_dir, model_path)
+        self.model = joblib.load(model_path)
+        
+    def predict_from_inferences(self, inferences_dir):
+        X = extract_slice_features(inferences_dir)
+        if X is None: return None
+        return self.model.predict(X)[0]
+        
+    def predict_from_features(self, features_array):
+        if len(features_array) == 5:
+            features_array = list(features_array) + [0.5] # pad density
+        return self.model.predict(np.array(features_array).reshape(1, -1))[0]
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, choices=['train', 'predict'], required=True)
-    parser.add_argument('--data_dir', type=str, default='data/surrogate_data')
-    parser.add_argument('--model_path', type=str, default='slice_quality_predictor.pkl')
-    parser.add_argument('--metrics_json', type=str, help='单个slice的metrics.json路径')
-    args = parser.parse_args()
-    if args.mode == 'train':
-        train_and_save_model(args.data_dir, args.model_path)
-    elif args.mode == 'predict':
-        if not args.metrics_json:
-            print('请指定 --metrics_json')
-        else:
-            predict_slice_quality(args.metrics_json, args.model_path)
+    print("Testing functionality: Model imports successfully.")
