@@ -100,7 +100,8 @@ def load_recommendations(predictor):
             dist.get("Domain_Span", 0.0), 0.5
         ]
         pred_pr = predictor.predict_from_features(features)
-        candidates.append((item["mixture_id"], pred_pr, features))
+        sample_size = len(item.get("sampled_ids", []))
+        candidates.append((item["mixture_id"], pred_pr, features, sample_size))
         
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[:3]  
@@ -108,57 +109,57 @@ def load_recommendations(predictor):
 def run_physical_evaluation(mix_id, target_dir, num_samples):
     print(f"\n🚀 [实时任务监控] 正在向物理显卡投递训练/验证任务: {mix_id}")
     print(f"数据量: {num_samples} 独立请求正在启动...")
-    
-    # Check initial inference state
-    out_dir = os.path.join(get_project_root(), f"data/surrogate_data/{mix_id}/inferences")
-    os.makedirs(out_dir, exist_ok=True)
-    
-    start_count = len(glob.glob(os.path.join(out_dir, "*_CoT@1.json")))
-    target_count = start_count + num_samples
-    
-    cmd = ["bash", "run_vllm_task_node.sh", mix_id, target_dir]
-    
     try:
-        proc = subprocess.Popen(cmd, cwd=get_project_root(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out_dir = os.path.join(get_project_root(), f"data/surrogate_data/{mix_id}/inferences")
+        os.makedirs(out_dir, exist_ok=True)
         
-        # Monitor the output directory
+        target_count = num_samples
+        start_count = len(glob.glob(os.path.join(out_dir, "*_CoT@1.json")))
         print("-------------------------------------------------------")
-        while proc.poll() is None:
-            current_count = len(glob.glob(os.path.join(out_dir, "*_CoT@1.json")))
-            sys.stdout.write(f"\r⏳ [Live Progress] 推理生成中: {current_count}/{target_count} ({current_count/target_count*100:.1f}%)   ")
-            sys.stdout.flush()
-            if current_count >= target_count:
-                break
-            time.sleep(2.0)
-            
-        proc.wait()
         
-        # Recalculate physical pass rate
+        if start_count >= target_count:
+            print(f"⏳ [Live Progress] 发现离线缓存数据已齐全 ({start_count}/{target_count})，跳过重复推断生成。")
+        else:
+            cmd = ["bash", "run_vllm_task_node.sh", mix_id, target_dir]
+            proc = subprocess.Popen(cmd, cwd=get_project_root(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while proc.poll() is None:
+                current_count = len(glob.glob(os.path.join(out_dir, "*_CoT@1.json")))
+                display_count = min(current_count, target_count)
+                safe_pct = (display_count / target_count * 100) if target_count > 0 else 100.0
+                sys.stdout.write(f"\r⏳ [Live Progress] 推理生成中: {display_count}/{target_count} ({safe_pct:.1f}%)   ")
+                sys.stdout.flush()
+                if current_count >= target_count:
+                    break
+                time.sleep(2.0)
+            proc.wait()
+            
         final_files = glob.glob(os.path.join(out_dir, "*_CoT@1.json"))
         passed = 0
         total = len(final_files)
-        
         for f in final_files:
             try:
                 with open(f, "r") as fp:
                     d = json.load(fp)
-                    c_valid = d.get('answer_generation', {}).get('valid_data', False)
-                    c_err = "error" in str(d).lower()
-                    if c_valid and not c_err: passed += 1
-            except: pass
-            
+                    ans_gen = d.get('answer_generation', {})
+                    c_valid = ans_gen.get('valid_data', False)
+                    c_err = False
+                    for step in ans_gen.get('intermediate_steps', []):
+                        if 'error' in str(step.get('observation','')).lower():
+                            c_err = True
+                    if c_valid and not c_err:
+                        passed += 1
+            except:
+                pass
+                
         real_pr = (passed / total) if total > 0 else 0.0
         
         print(f"\n🎉 [评测完成] 物理训练验证结束！")
         print(f"✅ 测得绝对物理真实通过率: {real_pr:.2%}")
         print("-------------------------------------------------------")
-        
         return real_pr
-        
     except Exception as e:
         print(f"\n❌ [错误] 物理执行异常: {str(e)}")
         return 0.0
-
 def main():
     root_dir = get_project_root()
     predictor = SliceQualityPredictor(os.path.join(os.path.dirname(__file__), 'paper_quality_predictor.pkl'))
@@ -178,7 +179,7 @@ def main():
     while True:
         recs = load_recommendations(predictor)
         print("\n>> Surrogate Model (预测模型) 为您推荐的静态候选 Slice (Top-3):")
-        for i, (mix_id, pr, feats) in enumerate(recs):
+        for i, (mix_id, pr, feats, sample_size) in enumerate(recs):
             print(f"  [{i+1}] {mix_id} | 预期: {pr:.2%} | (Chain={feats[1]:.2f}, Topo={feats[2]:.2f}, Comp={feats[3]:.2f}, Dom={feats[4]:.2f})")
         print("-------------------------------------------------------\n")
         
@@ -195,13 +196,12 @@ def main():
             sel = int(input("选择推荐编号 (1/2/3): ")) - 1
             rec_mix_id = recs[sel][0]
             rec_pred = recs[sel][1]
+            rec_num = recs[sel][3]
             
-            # Since it's a pre-built static recommendation, grab its current sample size
-            # To mock the file execution, we will point it to the valid folder
             mix_dir = f"surrogate_training_mixtures/{rec_mix_id}"
             
-            print(f"\n[启动流水线] 开始对推荐集 {rec_mix_id} 进行物理测算 (预测通过率: {rec_pred:.2%})")
-            run_physical_evaluation(rec_mix_id, mix_dir, 50)
+            print(f"\n[启动流水线] 开始对推荐集 {rec_mix_id} 进行物理测算 (预测通过率: {rec_pred:.2%}, 数据量: {rec_num})")
+            run_physical_evaluation(rec_mix_id, mix_dir, rec_num)
             
             _ = input("\n[操作完成] 按回车键继续下一轮洞察探索...")
             
